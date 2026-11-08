@@ -4,20 +4,30 @@
  * Flow (pay-per-call, DevNet only):
  * 1. The client builds + signs a 0.01 SOL transfer to the agent wallet
  *    (Solana Pay transfer request) and sends the signature here.
- * 2. We verify the payment on-chain (transaction exists, confirmed,
- *    agent wallet received >= 0.01 SOL) and reject replayed signatures.
- * 3. We check the payer's session limit — the client pre-checks this too,
- *    so a hit here means the limit was crossed between check and payment.
- * 4. We claim the signature BEFORE running the tool, so a concurrent
- *    replay of the same payment can't slip through while the first call
- *    is still summarizing. If the tool fails, the claim is released and
- *    the payment can be retried — a failed call never burns the payment.
- * 5. We run the Summarize tool (Gemini primary with retries, honest
+ * 2. We check the durable store (Neon Postgres, lib/db.ts) — a signature
+ *    already redeemed returns 409 before any AI work happens.
+ * 3. We verify the payment on-chain (transaction exists, confirmed,
+ *    agent wallet received >= 0.01 SOL) and reject bad payments.
+ * 4. We check the payer's session limit in the DB — the client pre-checks
+ *    this too, so a hit here means the limit was crossed between check
+ *    and payment. A limit block never claims the signature.
+ * 5. We claim the signature in the DB BEFORE running the tool. The claim
+ *    is a single INSERT guarded by the table's PRIMARY KEY, so a
+ *    concurrent replay on another Vercel instance loses the race and gets
+ *    409 — no summary, no charge. If the tool fails, the claim is
+ *    released and the payment can be retried — a failed call never burns
+ *    the payment.
+ * 6. We run the Summarize tool (Gemini primary with retries, honest
  *    deterministic fallback labeled as such).
- * 6. ONLY after a summary is returned do we record the spend against the
- *    session limit. A failed call = no payment recorded, clear error shown.
- *    The response's spent/remaining values are read AFTER the charge is
- *    recorded, so the meter in the response never lags the true total.
+ * 7. ONLY after a summary is returned do we record the spend in the DB.
+ *    The response's spent/remaining values are read from that same
+ *    charge, so the meter in the response never lags the true total.
+ *    If the charge write fails, the claim is released (payment not
+ *    burned) and the call returns 500.
+ *
+ * The replay guard and the meter are durable across every serverless
+ * instance because both live in Neon, not in this process's memory.
+ * Any DB failure fails the call closed (500, no summary, no charge).
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -26,10 +36,16 @@ import {
   DEFAULT_SESSION_LIMIT_SOL,
   PRICE_PER_CALL_LAMPORTS,
   PRICE_PER_CALL_SOL,
-  getRemainingLamports,
   lamportsToSol,
-  recordSpend,
+  remainingLamports,
 } from "@/lib/pricing";
+import {
+  claimSignature,
+  getRemainingLamports,
+  isSignatureUsed,
+  recordSpend,
+  releaseSignature,
+} from "@/lib/db";
 import {
   getAgentPublicKey,
   getExplorerTxUrl,
@@ -42,16 +58,18 @@ import { summarize } from "@/lib/agent";
 // set here. This handler reads the request body and env vars, which makes
 // it dynamic at request time by default (route handlers are not cached).
 
-// Signatures already redeemed, so one payment can't buy two summaries.
-// IN-MEMORY ONLY: this Set lives in this serverless function instance's
-// memory. It is lost on redeploy/restart and is NOT shared between
-// concurrent Vercel instances, so a replay that lands on a fresh instance
-// is not caught here. Durable replay protection needs a shared store
-// (Vercel KV / Upstash Redis / a Neon table keyed by signature) — swap
-// this Set for that store before relying on it across instances.
-const usedSignatures = new Set<string>();
-
 const MAX_TEXT_LENGTH = 5000;
+
+function storeUnavailable(error: unknown) {
+  return NextResponse.json(
+    {
+      error:
+        "The spend store is unavailable — no summary was produced and no " +
+        `payment was recorded. (${(error as Error).message})`,
+    },
+    { status: 500 },
+  );
+}
 
 export async function POST(req: NextRequest) {
   let body: { text?: string; signature?: string; payer?: string };
@@ -83,14 +101,22 @@ export async function POST(req: NextRequest) {
       { status: 400 },
     );
   }
-  if (usedSignatures.has(signature)) {
+
+  // 2. Durable replay check (fast path, before any AI work).
+  let alreadyUsed: boolean;
+  try {
+    alreadyUsed = await isSignatureUsed(signature);
+  } catch (error) {
+    return storeUnavailable(error);
+  }
+  if (alreadyUsed) {
     return NextResponse.json(
       { error: "This payment was already used for a summary." },
       { status: 409 },
     );
   }
 
-  // 1. Verify the on-chain payment before doing any AI work.
+  // 3. Verify the on-chain payment before doing any AI work.
   const agentWallet = getAgentPublicKey();
   let verification;
   try {
@@ -110,8 +136,14 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 2. Session limit check (client pre-checks; this is the server-side guard).
-  const remaining = getRemainingLamports(payer);
+  // 4. Session limit check (client pre-checks; this is the server-side guard).
+  // A limit block never claims the signature.
+  let remaining: number;
+  try {
+    remaining = await getRemainingLamports(payer);
+  } catch (error) {
+    return storeUnavailable(error);
+  }
   if (remaining < PRICE_PER_CALL_LAMPORTS) {
     return NextResponse.json(
       {
@@ -122,16 +154,28 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 4. Claim the signature BEFORE running the tool (see header step 4).
-  usedSignatures.add(signature);
+  // 5. Claim the signature in the DB BEFORE running the tool (see header
+  // step 5). A false return means a concurrent replay claimed it first.
+  let claimed: boolean;
+  try {
+    claimed = await claimSignature(signature, payer);
+  } catch (error) {
+    return storeUnavailable(error);
+  }
+  if (!claimed) {
+    return NextResponse.json(
+      { error: "This payment was already used for a summary." },
+      { status: 409 },
+    );
+  }
 
-  // 5. Run the tool. Spend is recorded ONLY if a summary comes back.
+  // 6. Run the tool. Spend is recorded ONLY if a summary comes back.
   let result;
   try {
     result = await summarize(text);
   } catch (error) {
     // Tool failed: release the claim so the same payment can be retried.
-    usedSignatures.delete(signature);
+    await releaseSignature(signature).catch(() => undefined);
     return NextResponse.json(
       {
         error: `The Summarize tool failed: ${(error as Error).message}. No payment was recorded for this call.`,
@@ -141,7 +185,7 @@ export async function POST(req: NextRequest) {
   }
   if (!result.summary) {
     // Empty result: same release — the payment is not burned.
-    usedSignatures.delete(signature);
+    await releaseSignature(signature).catch(() => undefined);
     return NextResponse.json(
       {
         error:
@@ -151,10 +195,17 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 6. Charge the session, then read the meter AFTER the charge so the
-  //    response's spent/remaining values never lag the true total.
-  const spentAfter = recordSpend(payer);
-  const remainingAfter = getRemainingLamports(payer);
+  // 7. Charge the session in the DB. If the charge write fails, release
+  // the claim (payment not burned) and fail closed. The response meter
+  // is computed from the charge itself, so it never lags the true total.
+  let spentAfter: number;
+  try {
+    spentAfter = await recordSpend(payer);
+  } catch (error) {
+    await releaseSignature(signature).catch(() => undefined);
+    return storeUnavailable(error);
+  }
+  const remainingAfter = remainingLamports(spentAfter);
 
   return NextResponse.json({
     summary: result.summary,

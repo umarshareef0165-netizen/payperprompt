@@ -3,8 +3,10 @@
  *
  * The on-chain verifier and the Summarize tool are mocked; the replay
  * guard, session-limit guard, charging, and meter values are the real
- * code paths. Each test uses its own signature so the module-level
- * redeemed-signature set never leaks between tests.
+ * code paths, running against an in-memory fake of the spend store
+ * (lib/test-store.ts) behind the same interface the Neon store
+ * implements — no real DB needed. Each test gets a fresh fake store,
+ * and each test uses its own signature.
  * Run with: npm test
  */
 import { describe, expect, it, beforeEach, vi } from "vitest";
@@ -29,9 +31,13 @@ import {
   getSpentLamports,
   recordSpend,
   resetSession,
+  setSpendStore,
+} from "@/lib/db";
+import {
   PRICE_PER_CALL_LAMPORTS,
   DEFAULT_SESSION_LIMIT_LAMPORTS,
 } from "@/lib/pricing";
+import { createMemoryStore } from "@/lib/test-store";
 
 const mockedVerify = vi.mocked(verifyPayment);
 const mockedSummarize = vi.mocked(summarize);
@@ -58,8 +64,11 @@ function askBody(signature: string, text: string = TEXT) {
   return { text, signature, payer: PAYER };
 }
 
+let fake: ReturnType<typeof createMemoryStore>;
+
 beforeEach(() => {
-  resetSession();
+  fake = createMemoryStore();
+  setSpendStore(fake);
   vi.clearAllMocks();
   mockedVerify.mockResolvedValue({
     ok: true,
@@ -82,7 +91,7 @@ describe("POST /api/ask — fresh payment", () => {
     expect(body.spentSol).toBe(0.01);
     expect(body.remainingSol).toBe(0.49);
     expect(body.spentLamports).toBe(PRICE_PER_CALL_LAMPORTS);
-    expect(getSpentLamports(PAYER)).toBe(PRICE_PER_CALL_LAMPORTS);
+    expect(await getSpentLamports(PAYER)).toBe(PRICE_PER_CALL_LAMPORTS);
     expect(mockedVerify).toHaveBeenCalledTimes(1);
     expect(mockedSummarize).toHaveBeenCalledTimes(1);
   });
@@ -99,7 +108,7 @@ describe("POST /api/ask — fresh payment", () => {
     // Post-charge values: 2 calls = 0.02 spent, 0.48 remaining.
     expect(body.spentSol).toBe(0.02);
     expect(body.remainingSol).toBe(0.48);
-    expect(getSpentLamports(PAYER)).toBe(2 * PRICE_PER_CALL_LAMPORTS);
+    expect(await getSpentLamports(PAYER)).toBe(2 * PRICE_PER_CALL_LAMPORTS);
   });
 });
 
@@ -107,7 +116,7 @@ describe("POST /api/ask — replay protection", () => {
   it("reusing a signature returns 409, no new summary, no charge", async () => {
     const first = await POST(makeReq(askBody("sig-replay-1", TEXT)));
     expect(first.status).toBe(200);
-    expect(getSpentLamports(PAYER)).toBe(PRICE_PER_CALL_LAMPORTS);
+    expect(await getSpentLamports(PAYER)).toBe(PRICE_PER_CALL_LAMPORTS);
 
     const replay = await POST(
       makeReq(askBody("sig-replay-1", "Different text, same payment.")),
@@ -117,19 +126,35 @@ describe("POST /api/ask — replay protection", () => {
     expect(String(body.error)).toContain("already used");
     // No second summary, no second charge.
     expect(mockedSummarize).toHaveBeenCalledTimes(1);
-    expect(getSpentLamports(PAYER)).toBe(PRICE_PER_CALL_LAMPORTS);
+    expect(await getSpentLamports(PAYER)).toBe(PRICE_PER_CALL_LAMPORTS);
+  });
+
+  it("a lost claim race returns 409 without burning the payment", async () => {
+    // Simulate a concurrent replay winning the claim race after our
+    // verification but before our claim (the Neon PRIMARY KEY does this
+    // for real across instances).
+    fake.failNextClaim();
+    const raced = await POST(makeReq(askBody("sig-race-1")));
+    expect(raced.status).toBe(409);
+    expect(mockedSummarize).not.toHaveBeenCalled();
+    expect(await getSpentLamports(PAYER)).toBe(0);
+
+    // The payment was NOT recorded as used, so it retries cleanly.
+    const retry = await POST(makeReq(askBody("sig-race-1")));
+    expect(retry.status).toBe(200);
+    expect(await getSpentLamports(PAYER)).toBe(PRICE_PER_CALL_LAMPORTS);
   });
 
   it("a failed tool call releases the signature so the payment can be retried", async () => {
     mockedSummarize.mockRejectedValueOnce(new Error("Gemini exploded"));
     const failed = await POST(makeReq(askBody("sig-retry-1")));
     expect(failed.status).toBe(500);
-    expect(getSpentLamports(PAYER)).toBe(0);
+    expect(await getSpentLamports(PAYER)).toBe(0);
 
     // Same payment retries cleanly once the tool works again.
     const retry = await POST(makeReq(askBody("sig-retry-1")));
     expect(retry.status).toBe(200);
-    expect(getSpentLamports(PAYER)).toBe(PRICE_PER_CALL_LAMPORTS);
+    expect(await getSpentLamports(PAYER)).toBe(PRICE_PER_CALL_LAMPORTS);
   });
 });
 
@@ -142,7 +167,7 @@ describe("POST /api/ask — payment verification failures", () => {
     });
     const res = await POST(makeReq(askBody("sig-fake-1")));
     expect(res.status).toBe(402);
-    expect(getSpentLamports(PAYER)).toBe(0);
+    expect(await getSpentLamports(PAYER)).toBe(0);
     expect(mockedSummarize).not.toHaveBeenCalled();
   });
 
@@ -150,7 +175,7 @@ describe("POST /api/ask — payment verification failures", () => {
     mockedVerify.mockRejectedValue(new Error("RPC down"));
     const res = await POST(makeReq(askBody("sig-err-1")));
     expect(res.status).toBe(502);
-    expect(getSpentLamports(PAYER)).toBe(0);
+    expect(await getSpentLamports(PAYER)).toBe(0);
     expect(mockedSummarize).not.toHaveBeenCalled();
   });
 });
@@ -176,15 +201,17 @@ describe("POST /api/ask — bad input", () => {
 
 describe("POST /api/ask — session limit", () => {
   it("blocks at the limit with 402 and does NOT consume the signature", async () => {
-    for (let i = 0; i < 50; i++) recordSpend(PAYER);
-    expect(getSpentLamports(PAYER)).toBe(DEFAULT_SESSION_LIMIT_LAMPORTS);
+    for (let i = 0; i < 50; i++) await recordSpend(PAYER);
+    expect(await getSpentLamports(PAYER)).toBe(
+      DEFAULT_SESSION_LIMIT_LAMPORTS,
+    );
 
     const blocked = await POST(makeReq(askBody("sig-limit-1")));
     expect(blocked.status).toBe(402);
     expect(mockedSummarize).not.toHaveBeenCalled();
 
     // The payment was not consumed: after a fresh session it works.
-    resetSession();
+    await resetSession();
     const retry = await POST(makeReq(askBody("sig-limit-1")));
     expect(retry.status).toBe(200);
   });
