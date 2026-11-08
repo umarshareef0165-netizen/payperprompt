@@ -17,9 +17,9 @@ One tool, one payment, one limit. No token, no marketplace, no extra pages.
 
 ## Live demo
 
-- **Live app:** _TODO — Vercel URL goes here after deploy_
-- **Example DevNet transaction:** _TODO — paste a real Solana Explorer transaction link after the first live paid call_
-- **Repo:** _TODO — public GitHub repo link after the browser task creates it_
+- **Live app:** https://payperprompt-8clp3h9d8-umarshareef0165-7088s-projects.vercel.app/
+- **Example DevNet transaction:** https://explorer.solana.com/tx/GJR2vdhq2B7nrPsXArqR1SJydwipXM3iY78jXDJtbm3PKJeixqsXRuiExpbbWgS63Rana6rVtFC3LGpkcXt6qwS?cluster=devnet (0.01 SOL paid call, verified live; meter spent 0.03 / remaining 0.47 after 3 paid calls)
+- **Repo:** https://github.com/umarshareef0165-netizen/payperprompt
 
 ## Tech
 
@@ -68,5 +68,5 @@ npm run build   # must pass with zero errors before deploy
 
 ## Submission
 
-- MLH Challenges: https://www.mlh.com/events/solana-hackathon — initial Sun Nov 8, 7:00 AM PT; final Sun Nov 8, 8:45 AM PT
+- MLH Challenges: https://www.mlh.com/events/solana-hackathon — submissions close Nov 8, 1:00 PM EST (10:00 AM PST, verified on the form page Nov 7, 06:57 PST); aim for the 7:00 AM PT initial window
 - Demo video (≤2:00, own voice): _TODO — YouTube link after recording_
