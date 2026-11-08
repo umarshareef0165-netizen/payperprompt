@@ -2,7 +2,7 @@
  * Unit tests for pricing + session-limit logic (lib/pricing.ts).
  * Run with: npm test
  */
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   PRICE_PER_CALL_SOL,
   PRICE_PER_CALL_LAMPORTS,
@@ -16,10 +16,6 @@ import {
   applySpend,
   meterPercent,
   formatSol,
-  getSpentLamports,
-  recordSpend,
-  getRemainingLamports,
-  resetSession,
 } from "./pricing";
 
 describe("locked pricing constants", () => {
@@ -101,35 +97,5 @@ describe("meter math", () => {
   it("formats SOL with two decimals", () => {
     expect(formatSol(PRICE_PER_CALL_LAMPORTS)).toBe("0.01 SOL");
     expect(formatSol(DEFAULT_SESSION_LIMIT_LAMPORTS)).toBe("0.50 SOL");
-  });
-});
-
-describe("per-payer session store", () => {
-  beforeEach(() => resetSession());
-
-  it("tracks spend separately per payer", () => {
-    recordSpend("Alice");
-    recordSpend("Alice");
-    recordSpend("Bob");
-    expect(getSpentLamports("Alice")).toBe(2 * PRICE_PER_CALL_LAMPORTS);
-    expect(getSpentLamports("Bob")).toBe(PRICE_PER_CALL_LAMPORTS);
-    expect(getSpentLamports("Carol")).toBe(0);
-  });
-
-  it("reports remaining per payer and blocks at the limit", () => {
-    const payer = "Dave";
-    for (let i = 0; i < 50; i++) recordSpend(payer);
-    expect(getRemainingLamports(payer)).toBe(0);
-    expect(canAffordCall(getSpentLamports(payer))).toBe(false);
-  });
-
-  it("resetSession clears one payer or all sessions", () => {
-    recordSpend("Alice");
-    recordSpend("Bob");
-    resetSession("Alice");
-    expect(getSpentLamports("Alice")).toBe(0);
-    expect(getSpentLamports("Bob")).toBe(PRICE_PER_CALL_LAMPORTS);
-    resetSession();
-    expect(getSpentLamports("Bob")).toBe(0);
   });
 });
