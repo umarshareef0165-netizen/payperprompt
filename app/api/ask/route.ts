@@ -8,10 +8,16 @@
  *    agent wallet received >= 0.01 SOL) and reject replayed signatures.
  * 3. We check the payer's session limit — the client pre-checks this too,
  *    so a hit here means the limit was crossed between check and payment.
- * 4. We run the Summarize tool (Gemini primary with retries, honest
+ * 4. We claim the signature BEFORE running the tool, so a concurrent
+ *    replay of the same payment can't slip through while the first call
+ *    is still summarizing. If the tool fails, the claim is released and
+ *    the payment can be retried — a failed call never burns the payment.
+ * 5. We run the Summarize tool (Gemini primary with retries, honest
  *    deterministic fallback labeled as such).
- * 5. ONLY after a summary is returned do we record the spend against the
+ * 6. ONLY after a summary is returned do we record the spend against the
  *    session limit. A failed call = no payment recorded, clear error shown.
+ *    The response's spent/remaining values are read AFTER the charge is
+ *    recorded, so the meter in the response never lags the true total.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -21,7 +27,6 @@ import {
   PRICE_PER_CALL_LAMPORTS,
   PRICE_PER_CALL_SOL,
   getRemainingLamports,
-  getSpentLamports,
   lamportsToSol,
   recordSpend,
 } from "@/lib/pricing";
@@ -38,6 +43,12 @@ import { summarize } from "@/lib/agent";
 // it dynamic at request time by default (route handlers are not cached).
 
 // Signatures already redeemed, so one payment can't buy two summaries.
+// IN-MEMORY ONLY: this Set lives in this serverless function instance's
+// memory. It is lost on redeploy/restart and is NOT shared between
+// concurrent Vercel instances, so a replay that lands on a fresh instance
+// is not caught here. Durable replay protection needs a shared store
+// (Vercel KV / Upstash Redis / a Neon table keyed by signature) — swap
+// this Set for that store before relying on it across instances.
 const usedSignatures = new Set<string>();
 
 const MAX_TEXT_LENGTH = 5000;
@@ -111,11 +122,16 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 3. Run the tool. Spend is recorded ONLY if a summary comes back.
+  // 4. Claim the signature BEFORE running the tool (see header step 4).
+  usedSignatures.add(signature);
+
+  // 5. Run the tool. Spend is recorded ONLY if a summary comes back.
   let result;
   try {
     result = await summarize(text);
   } catch (error) {
+    // Tool failed: release the claim so the same payment can be retried.
+    usedSignatures.delete(signature);
     return NextResponse.json(
       {
         error: `The Summarize tool failed: ${(error as Error).message}. No payment was recorded for this call.`,
@@ -124,6 +140,8 @@ export async function POST(req: NextRequest) {
     );
   }
   if (!result.summary) {
+    // Empty result: same release — the payment is not burned.
+    usedSignatures.delete(signature);
     return NextResponse.json(
       {
         error:
@@ -133,7 +151,8 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  usedSignatures.add(signature);
+  // 6. Charge the session, then read the meter AFTER the charge so the
+  //    response's spent/remaining values never lag the true total.
   const spentAfter = recordSpend(payer);
   const remainingAfter = getRemainingLamports(payer);
 
