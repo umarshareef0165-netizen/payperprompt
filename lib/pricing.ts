@@ -1,14 +1,17 @@
 /**
- * Pricing + session spending-limit logic for PayPerPrompt.
+ * Pricing + session spending-limit math for PayPerPrompt.
  *
  * Locked numbers (MLH Solana Hackathon, AI track):
  * - Price per tool call: 0.01 SOL
  * - Default session spending limit: 0.5 SOL
  *
  * All money math is done in lamports (integers) so the meter is exact.
- * The session store is in-memory and keyed by the payer's wallet address.
- * DevNet demo only — a restart resets every session, which is fine for the
- * hackathon demo (limits are per-session, not per-account).
+ *
+ * This file is PURE functions + constants only. The stateful store
+ * (which signatures are used, how much a payer has spent) lives in
+ * lib/db.ts backed by Neon Postgres — the old in-memory Map here was
+ * per-instance only, so a meter read on another Vercel instance saw
+ * stale spend (live re-verification: meter went 0.02 -> 0.01).
  */
 
 export const PRICE_PER_CALL_SOL = 0.01;
@@ -70,40 +73,4 @@ export function meterPercent(
 /** Format lamports as a SOL string with 2 decimals (e.g. "0.49 SOL"). */
 export function formatSol(lamports: number): string {
   return `${lamportsToSol(lamports).toFixed(2)} SOL`;
-}
-
-// ---------------------------------------------------------------------------
-// In-memory per-payer session store (server-side only).
-// ---------------------------------------------------------------------------
-
-const spentByPayer = new Map<string, number>();
-
-export function getSpentLamports(payer: string): number {
-  return spentByPayer.get(payer) ?? 0;
-}
-
-/** Record a paid call for a payer. Returns the new spent total. */
-export function recordSpend(
-  payer: string,
-  amountLamports: number = PRICE_PER_CALL_LAMPORTS,
-): number {
-  const next = getSpentLamports(payer) + amountLamports;
-  spentByPayer.set(payer, next);
-  return next;
-}
-
-export function getRemainingLamports(
-  payer: string,
-  limitLamports: number = DEFAULT_SESSION_LIMIT_LAMPORTS,
-): number {
-  return remainingLamports(getSpentLamports(payer), limitLamports);
-}
-
-/** Test helper: clear one payer's session (or all sessions). */
-export function resetSession(payer?: string): void {
-  if (payer) {
-    spentByPayer.delete(payer);
-  } else {
-    spentByPayer.clear();
-  }
 }

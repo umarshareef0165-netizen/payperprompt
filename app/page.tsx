@@ -73,9 +73,21 @@ export default function Home() {
     setLimit(data);
   }, [publicKey]);
 
+  // Mount-time meter fetch (documented async-fetch-in-effect pattern:
+  // setLimit runs only after the fetch resolves, never synchronously).
   useEffect(() => {
-    refreshLimit().catch(() => undefined);
-  }, [refreshLimit]);
+    let ignore = false;
+    const payer = publicKey?.toBase58() ?? "";
+    fetch(`/api/limit?payer=${payer}`)
+      .then(async (res) => {
+        if (!res.ok || ignore) return;
+        setLimit((await res.json()) as LimitState);
+      })
+      .catch(() => undefined);
+    return () => {
+      ignore = true;
+    };
+  }, [publicKey]);
 
   const handleAsk = async () => {
     setError(null);
