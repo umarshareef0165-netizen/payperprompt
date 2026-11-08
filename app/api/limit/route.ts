@@ -2,6 +2,10 @@
  * GET /api/limit?payer=<wallet address> — session spending-limit status.
  * Used by the UI meter (before the user signs anything) and as the
  * pre-payment affordability check.
+ *
+ * Spend is read from Neon (lib/db.ts), the single source of truth across
+ * every serverless instance. If the DB is unreachable the route fails
+ * closed (500) instead of reporting a wrong 0.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -11,11 +15,10 @@ import {
   PRICE_PER_CALL_LAMPORTS,
   PRICE_PER_CALL_SOL,
   canAffordCall,
-  getRemainingLamports,
-  getSpentLamports,
   lamportsToSol,
   meterPercent,
 } from "@/lib/pricing";
+import { getRemainingLamports, getSpentLamports } from "@/lib/db";
 import { getAgentPublicKey, getExplorerAccountUrl } from "@/lib/solana";
 
 // NOTE (Next 16): route segment configs `runtime` / `dynamic` are not
@@ -25,11 +28,25 @@ import { getAgentPublicKey, getExplorerAccountUrl } from "@/lib/solana";
 
 export async function GET(req: NextRequest) {
   const payer = req.nextUrl.searchParams.get("payer") ?? "";
-  const spent = payer ? getSpentLamports(payer) : 0;
-  const remaining = payer
-    ? getRemainingLamports(payer)
-    : DEFAULT_SESSION_LIMIT_LAMPORTS;
   const agentWallet = getAgentPublicKey().toBase58();
+
+  let spent = 0;
+  let remaining = DEFAULT_SESSION_LIMIT_LAMPORTS;
+  if (payer) {
+    try {
+      spent = await getSpentLamports(payer);
+      remaining = await getRemainingLamports(payer);
+    } catch (error) {
+      return NextResponse.json(
+        {
+          error:
+            "The spend store is unavailable — the meter cannot be read. " +
+            `(${(error as Error).message})`,
+        },
+        { status: 500 },
+      );
+    }
+  }
 
   return NextResponse.json({
     payer: payer || null,
