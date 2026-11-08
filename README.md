@@ -17,7 +17,8 @@ One tool, one payment, one limit. No token, no marketplace, no extra pages.
 
 ## Live demo
 
-- **Live app:** https://payperprompt-8clp3h9d8-umarshareef0165-7088s-projects.vercel.app/
+- **Live app:** https://payperprompt-three.vercel.app/ (Production deployment, Neon fix live; the 8clp3h9d8 URL is a stale pre-fix deployment — do not use it)
+- **Replay protection, verified live on Production 2026-11-08 08:19 PST:** re-submitting a used payment signature returns **HTTP 409 "This payment was already used for a summary."** (second replay of tx 65o2u5a19DHE4jTWMVFBtsaYUzxDGsiRjtrsmZg5gKcrz4a3JhzSgFgrC6znrfkmqBZKjgvb9Ec4PpZjz1NzfrW; first replay charged 0.01 from the DB meter, second was blocked).
 - **Example DevNet transaction:** https://explorer.solana.com/tx/GJR2vdhq2B7nrPsXArqR1SJydwipXM3iY78jXDJtbm3PKJeixqsXRuiExpbbWgS63Rana6rVtFC3LGpkcXt6qwS?cluster=devnet (0.01 SOL paid call, verified live; meter spent 0.03 / remaining 0.47 after 3 paid calls)
 - **Repo:** https://github.com/umarshareef0165-netizen/payperprompt
 
@@ -69,4 +70,4 @@ npm run build   # must pass with zero errors before deploy
 ## Submission
 
 - MLH Challenges: https://www.mlh.com/events/solana-hackathon — submissions close Nov 8, 1:00 PM EST (10:00 AM PST, verified on the form page Nov 7, 06:57 PST); aim for the 7:00 AM PT initial window
-- Demo video (≤2:00, own voice): _TODO — YouTube link after recording_
+- Demo video (118.84s, AI voice): https://youtu.be/Rwu3ahKivWE
